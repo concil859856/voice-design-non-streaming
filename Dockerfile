@@ -43,6 +43,14 @@ COPY samples/ ./samples/
 
 RUN pip install --no-deps -e .
 
+# Build-time import smoke test — verifies the full import chain the
+# entrypoint exercises (torch + faster-qwen3-tts + qwen_tts + this
+# package) is internally consistent. Cheap (no GPU, no model load,
+# ~5 s) but catches torch ABI mismatches and missing modules BEFORE
+# the image reaches Docker Hub. Runs on the CPU-only GHA runner.
+RUN python3 -c "import torch; print('torch', torch.__version__)" \
+    && python3 -c "from qwen3_voice_design.server import main; print('server import OK')"
+
 VOLUME /cache/hf
 
 EXPOSE 8112
