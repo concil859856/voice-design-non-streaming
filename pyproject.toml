@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=77.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["qwen3_voice_design*"]
+
+[tool.setuptools.package-data]
+qwen3_voice_design = ["../samples/*.wav", "../samples/*.txt"]
+
+[project]
+name = "qwen3-voice-design"
+version = "0.1.0"
+description = "Non-streaming voice-design HTTP server (Qwen3-TTS-12Hz-1.7B-VoiceDesign) — drop-in for the Vocence backend's Chutes /speak call"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Vocence" }]
+keywords = ["tts", "qwen3", "voice-design", "non-streaming"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+
+# Versions pinned to match faster-qwen3-tts/pyproject.toml so a single
+# environment can install both without resolver conflicts.
+dependencies = [
+    "faster-qwen3-tts>=0.2.6",
+    "qwen-tts>=0.1.1",
+    "transformers>=4.57",
+    "torch>=2.5.1",
+    "numpy",
+    "soundfile",
+    "huggingface-hub",
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+qwen3-voice-design = "qwen3_voice_design.server:main"
