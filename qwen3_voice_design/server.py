@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import io
 import json
 import logging
@@ -139,6 +140,72 @@ class _BadRequest(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Metrics — exposed via GET /metrics for the Vocence ops dashboard to scrape.
+# Same shape as fast-tts-streaming so the dashboard's poller treats every
+# service uniformly. Counters are monotonic; the backend computes per-minute
+# deltas. Percentiles come from a sliding window of recent durations.
+# ---------------------------------------------------------------------------
+
+class _Metrics:
+    def __init__(self, recent_window: int = 1000) -> None:
+        self._lock = threading.Lock()
+        self.start_ts = time.time()
+        self.requests_total = 0
+        self.requests_ok = 0
+        self.requests_err: dict[str, int] = {}
+        self.duration_ms_sum = 0.0
+        self.duration_ms_count = 0
+        self.recent_durations_ms: collections.deque[float] = collections.deque(maxlen=recent_window)
+        self.bytes_sent_total = 0
+        self.audio_ms_total = 0
+
+    def record_success(self, duration_ms: float, *, bytes_sent: int = 0, audio_ms: int = 0) -> None:
+        with self._lock:
+            self.requests_total += 1
+            self.requests_ok += 1
+            self.duration_ms_sum += duration_ms
+            self.duration_ms_count += 1
+            self.recent_durations_ms.append(duration_ms)
+            self.bytes_sent_total += bytes_sent
+            self.audio_ms_total += audio_ms
+
+    def record_error(self, code: str, duration_ms: float = 0.0) -> None:
+        with self._lock:
+            self.requests_total += 1
+            self.requests_err[code] = self.requests_err.get(code, 0) + 1
+            if duration_ms > 0:
+                self.duration_ms_sum += duration_ms
+                self.duration_ms_count += 1
+                self.recent_durations_ms.append(duration_ms)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            durations = sorted(self.recent_durations_ms)
+            n = len(durations)
+
+            def pct(p: float) -> float:
+                if n == 0:
+                    return 0.0
+                idx = min(n - 1, int(p * n))
+                return durations[idx]
+
+            return {
+                "uptime_seconds": int(time.time() - self.start_ts),
+                "requests_total": self.requests_total,
+                "requests_ok": self.requests_ok,
+                "requests_err": dict(self.requests_err),
+                "duration_ms_sum": self.duration_ms_sum,
+                "duration_ms_count": self.duration_ms_count,
+                "duration_ms_avg": (self.duration_ms_sum / self.duration_ms_count) if self.duration_ms_count else 0.0,
+                "duration_ms_p50": pct(0.50),
+                "duration_ms_p95": pct(0.95),
+                "duration_ms_p99": pct(0.99),
+                "bytes_sent_total": self.bytes_sent_total,
+                "audio_ms_total": self.audio_ms_total,
+            }
+
+
+# ---------------------------------------------------------------------------
 # WAV encoding
 # ---------------------------------------------------------------------------
 
@@ -217,11 +284,13 @@ class VoiceDesignServer:
         self._api_key = (api_key or "").strip()
         self._inflight = _InflightTracker(cap=cap)
         self._gpu_lock = threading.Lock()
+        self._metrics = _Metrics()
 
     # ---- HTTP -------------------------------------------------------------
     async def healthz(self, _request: web.Request) -> web.Response:
         return web.json_response({
             "status": "ok",
+            "service": "voice_design",
             "model_id": self._model_id,
             "sample_rate": SAMPLE_RATE,
             "inflight": self._inflight.inflight,
@@ -229,24 +298,46 @@ class VoiceDesignServer:
             "dev_stub": False,
         })
 
+    async def metrics(self, request: web.Request) -> web.Response:
+        """Scrape endpoint for the Vocence ops dashboard. Same bearer auth
+        as /speak so a public-IP rented box doesn't leak counters."""
+        if self._api_key:
+            header = request.headers.get("Authorization", "")
+            if header != f"Bearer {self._api_key}":
+                return _error_json(401, "auth", "missing or invalid bearer token")
+        snap = self._metrics.snapshot()
+        snap["service"] = "voice_design"
+        snap["inflight"] = self._inflight.inflight
+        snap["cap"] = self._inflight.cap
+        return web.json_response(snap)
+
     async def speak(self, request: web.Request) -> web.Response:
+        t_req = time.perf_counter()
+
+        def req_ms() -> float:
+            return (time.perf_counter() - t_req) * 1000.0
+
         # Bearer auth (skip when no key configured — dev mode).
         if self._api_key:
             header = request.headers.get("Authorization", "")
             if header != f"Bearer {self._api_key}":
+                self._metrics.record_error("auth", req_ms())
                 return _error_json(401, "auth", "missing or invalid bearer token")
 
         # Parse JSON.
         try:
             payload = await request.json()
         except json.JSONDecodeError as e:
+            self._metrics.record_error("bad_request", req_ms())
             return _error_json(400, "bad_request", f"invalid JSON: {e}")
         except Exception as e:
+            self._metrics.record_error("bad_request", req_ms())
             return _error_json(400, "bad_request", f"failed to read body: {e}")
 
         try:
             text, instruction, language = _parse_speak_request(payload)
         except _BadRequest as e:
+            self._metrics.record_error("bad_request", req_ms())
             return _error_json(400, "bad_request", e.message)
 
         # Slot acquisition — strict accept-or-reject. With cap=1 (default),
@@ -255,6 +346,7 @@ class VoiceDesignServer:
             slot_cm = self._inflight.slot()
             await slot_cm.__aenter__()
         except _ServerBusy:
+            self._metrics.record_error("server_busy", req_ms())
             return _error_json(503, "server_busy", f"inflight cap ({self._inflight.cap}) exhausted")
 
         t_start = time.perf_counter()
@@ -265,14 +357,21 @@ class VoiceDesignServer:
                     timeout=SYNTH_HARD_TIMEOUT_S,
                 )
             except asyncio.TimeoutError:
+                self._metrics.record_error("timeout", req_ms())
                 return _error_json(504, "timeout", f"synth exceeded {SYNTH_HARD_TIMEOUT_S}s")
             except _BadRequest as e:
+                self._metrics.record_error("bad_request", req_ms())
                 return _error_json(400, "bad_request", e.message)
             except Exception as e:
+                self._metrics.record_error("engine_failed", req_ms())
                 _log.exception("synthesis failed")
                 return _error_json(500, "engine_failed", f"{type(e).__name__}: {e}")
 
             elapsed = time.perf_counter() - t_start
+            # Audio bytes after the 44-byte WAV header are PCM16LE samples;
+            # 24 kHz mono → 2 bytes/sample → 1 ms = 48 bytes.
+            audio_ms = max(0, (len(wav_bytes) - 44) // 48)
+            self._metrics.record_success(req_ms(), bytes_sent=len(wav_bytes), audio_ms=audio_ms)
             _log.info(
                 "speak ok text=%d chars audio=%d bytes wall=%.2fs",
                 len(text), len(wav_bytes), elapsed,
@@ -376,6 +475,7 @@ def build_app(
     )
     app = web.Application(client_max_size=10 * 1024 * 1024)
     app.router.add_get("/healthz", server.healthz)
+    app.router.add_get("/metrics", server.metrics)
     app.router.add_post("/speak", server.speak)
     app["server"] = server
     return app
