@@ -18,7 +18,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HF_HOME=/cache/hf \
-    TRANSFORMERS_CACHE=/cache/hf/transformers \
     QWEN3_VD_HOST=0.0.0.0 \
     QWEN3_VD_PORT=8112
 
