@@ -41,7 +41,8 @@ COPY pyproject.toml ./
 COPY qwen3_voice_design/ ./qwen3_voice_design/
 COPY samples/ ./samples/
 
-RUN pip install --no-deps -e .
+RUN pip freeze | grep -iE '^(torch|torchaudio|torchvision)' > /tmp/torch-pin.txt \
+    && pip install -e . -c /tmp/torch-pin.txt
 
 # Build-time import smoke test — verifies the full import chain the
 # entrypoint exercises (torch + faster-qwen3-tts + qwen_tts + this
